@@ -1,0 +1,332 @@
+workflows:
+  android-debug:
+    name: Android Debug APK (for testing)
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      vars:
+        NODE_VERSION: "20"
+      node: $NODE_VERSION
+      java: 21
+    scripts:
+      - name: Install dependencies
+        script: npm install
+      - name: Add Android platform if missing
+        script: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+      - name: Sync Capacitor Android
+        script: npx cap sync android
+      - name: Patch AndroidManifest for GPS and notifications
+        script: |
+          python3 <<'PY'
+          path = "android/app/src/main/AndroidManifest.xml"
+          perms = [
+              "INTERNET",
+              "ACCESS_FINE_LOCATION",
+              "ACCESS_COARSE_LOCATION",
+              "ACCESS_NETWORK_STATE",
+              "POST_NOTIFICATIONS",
+              "VIBRATE",
+          ]
+          with open(path, encoding="utf-8") as f:
+              content = f.read()
+          for perm in perms:
+              token = f"android.permission.{perm}"
+              if token in content:
+                  print(f"Already has: {perm}")
+                  continue
+              line = f'    <uses-permission android:name="{token}" />\n'
+              if "<application" not in content:
+                  raise SystemExit("No <application tag found")
+              content = content.replace("<application", line + "<application", 1)
+              print(f"Added permission: {perm}")
+          if "android.hardware.location.gps" not in content and "<application" in content:
+              feature = '    <uses-feature android:name="android.hardware.location.gps" android:required="false" />\n'
+              content = content.replace("<application", feature + "<application", 1)
+              print("Added GPS hardware feature")
+          if "android:usesCleartextTraffic" not in content:
+              content = content.replace("<application ", '<application android:usesCleartextTraffic="true" ', 1)
+              print("Enabled usesCleartextTraffic")
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(content)
+          for required in ("ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"):
+              if f"android.permission.{required}" not in content:
+                  raise SystemExit(f"FAILED: missing {required}")
+          print("AndroidManifest.xml patched and verified successfully")
+          PY
+      - name: Verify location permissions in manifest
+        script: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          grep -q 'android.permission.ACCESS_FINE_LOCATION' "$MANIFEST"
+          grep -q 'android.permission.ACCESS_COARSE_LOCATION' "$MANIFEST"
+          echo "Location permissions verified in AndroidManifest.xml"
+      - name: Patch status bar spacing (no full screen under system bars)
+        script: |
+          python3 <<'PY'
+          import glob
+          import os
+          import re
+
+          values = "android/app/src/main/res/values"
+          colors_path = os.path.join(values, "colors.xml")
+          styles_path = os.path.join(values, "styles.xml")
+
+          if os.path.exists(colors_path):
+              with open(colors_path, encoding="utf-8") as f:
+                  colors = f.read()
+          else:
+              colors = '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n</resources>\n'
+          if 'name="statusBarColor"' not in colors:
+              colors = colors.replace("</resources>", '    <color name="statusBarColor">#FFFFFF</color>\n</resources>', 1)
+              with open(colors_path, "w", encoding="utf-8") as f:
+                  f.write(colors)
+              print("Added statusBarColor to colors.xml")
+          else:
+              print("colors.xml already has statusBarColor")
+
+          with open(styles_path, encoding="utf-8") as f:
+              styles = f.read()
+
+          items = [
+              ("android:windowFullscreen", '<item name="android:windowFullscreen">false</item>'),
+              ("android:statusBarColor", '<item name="android:statusBarColor">@color/statusBarColor</item>'),
+              ("android:navigationBarColor", '<item name="android:navigationBarColor">@color/statusBarColor</item>'),
+              ("android:windowLightStatusBar", '<item name="android:windowLightStatusBar">true</item>'),
+              ("android:fitsSystemWindows", '<item name="android:fitsSystemWindows">true</item>'),
+              ("android:windowOptOutEdgeToEdgeEnforcement", '<item name="android:windowOptOutEdgeToEdgeEnforcement">true</item>'),
+          ]
+
+          match = re.search(r'(<style\s+name="AppTheme\.NoActionBar"[^>]*>)(.*?)(</style>)', styles, re.DOTALL)
+          if not match:
+              raise SystemExit("AppTheme.NoActionBar style not found in styles.xml")
+
+          head, body, tail = match.group(1), match.group(2), match.group(3)
+          for attr, item in items:
+              if attr not in body:
+                  body = body.rstrip() + "\n        " + item + "\n    "
+          styles = styles[: match.start()] + head + body + tail + styles[match.end():]
+          with open(styles_path, "w", encoding="utf-8") as f:
+              f.write(styles)
+          print("styles.xml patched for status bar spacing")
+
+          mains = glob.glob("android/app/src/main/java/**/MainActivity.java", recursive=True)
+          if not mains:
+              print("MainActivity.java not found - skipping runtime inset patch")
+              raise SystemExit(0)
+
+          main_path = mains[0]
+          with open(main_path, encoding="utf-8") as f:
+              source = f.read()
+          if "setDecorFitsSystemWindows" in source:
+              print("MainActivity.java already applies system window insets")
+              raise SystemExit(0)
+
+          package_match = re.match(r"\s*package\s+([\w.]+);", source)
+          if not package_match:
+              raise SystemExit("Could not read package name from " + main_path)
+
+          template = """package __PACKAGE__;
+
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import androidx.core.view.WindowCompat;
+          import androidx.core.view.WindowInsetsControllerCompat;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  // Keep web content below the status bar (battery / network / clock)
+                  WindowCompat.setDecorFitsSystemWindows(getWindow(), true);
+                  getWindow().setStatusBarColor(Color.WHITE);
+                  WindowInsetsControllerCompat controller =
+                      WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+                  if (controller != null) {
+                      controller.setAppearanceLightStatusBars(true);
+                  }
+              }
+          }
+          """
+          with open(main_path, "w", encoding="utf-8") as f:
+              f.write(template.replace("__PACKAGE__", package_match.group(1)))
+          print("Patched " + main_path)
+          PY
+      - name: Verify status bar patch
+        script: |
+          STYLES="android/app/src/main/res/values/styles.xml"
+          grep -q 'android:windowOptOutEdgeToEdgeEnforcement' "$STYLES"
+          grep -q 'android:fitsSystemWindows' "$STYLES"
+          echo "Status bar spacing verified in styles.xml"
+      - name: Build debug APK
+        script: |
+          cd android
+          ./gradlew assembleDebug
+    artifacts:
+      - android/app/build/outputs/apk/debug/*.apk
+    publishing:
+      email:
+        recipients:
+          - YOUR_EMAIL@example.com
+        notify:
+          success: true
+          failure: true
+
+  ios-testflight:
+    name: iOS TestFlight
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+    integrations:
+      # Create an App Store Connect integration in Codemagic with this exact name.
+      app_store_connect: alfath_app_store_connect
+    environment:
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.alfath.attendance
+      vars:
+        XCODE_WORKSPACE: "App.xcworkspace"
+        XCODE_SCHEME: "App"
+      node: "20"
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Install dependencies
+        script: npm ci
+      - name: Create and sync Capacitor iOS project
+        script: |
+          if [ ! -d "ios" ]; then
+            npx cap add ios
+          fi
+          npx cap sync ios
+      - name: Configure iPhone permissions
+        script: |
+          PLIST="$CM_BUILD_DIR/ios/App/App/Info.plist"
+          if [ ! -f "$PLIST" ]; then
+            echo "Info.plist not found: $PLIST"
+            exit 1
+          fi
+
+          set_plist_value() {
+            KEY="$1"
+            TYPE="$2"
+            VALUE="$3"
+            /usr/libexec/PlistBuddy -c "Set :$KEY $VALUE" "$PLIST" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :$KEY $TYPE $VALUE" "$PLIST"
+          }
+
+          set_plist_value NSLocationWhenInUseUsageDescription string \
+            "يستخدم التطبيق موقعك للتحقق من تسجيل الحضور والانصراف داخل نطاق العمل."
+          set_plist_value UIFileSharingEnabled bool true
+          set_plist_value LSSupportsOpeningDocumentsInPlace bool true
+          set_plist_value ITSAppUsesNonExemptEncryption bool false
+
+          /usr/libexec/PlistBuddy -c "Print :NSLocationWhenInUseUsageDescription" "$PLIST"
+      - name: Set up iOS code signing
+        script: xcode-project use-profiles
+      - name: Set iOS build number
+        script: |
+          cd "$CM_BUILD_DIR/ios/App"
+          agvtool new-version -all "$PROJECT_BUILD_NUMBER"
+      - name: Build signed IPA
+        script: |
+          cd "$CM_BUILD_DIR/ios/App"
+          xcode-project build-ipa \
+            --workspace "$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
+    artifacts:
+      - ios/App/build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
+
+  android-release:
+    name: Android Release APK
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      android_signing:
+        - attendance_keystore
+      vars:
+        NODE_VERSION: "20"
+      node: $NODE_VERSION
+      java: 21
+    scripts:
+      - name: Install dependencies
+        script: npm install
+      - name: Add Android platform if missing
+        script: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+      - name: Sync Capacitor Android
+        script: npx cap sync android
+      - name: Patch AndroidManifest for GPS and notifications
+        script: |
+          python3 <<'PY'
+          path = "android/app/src/main/AndroidManifest.xml"
+          perms = [
+              "INTERNET",
+              "ACCESS_FINE_LOCATION",
+              "ACCESS_COARSE_LOCATION",
+              "ACCESS_NETWORK_STATE",
+              "POST_NOTIFICATIONS",
+              "VIBRATE",
+          ]
+          with open(path, encoding="utf-8") as f:
+              content = f.read()
+          for perm in perms:
+              token = f"android.permission.{perm}"
+              if token in content:
+                  print(f"Already has: {perm}")
+                  continue
+              line = f'    <uses-permission android:name="{token}" />\n'
+              if "<application" not in content:
+                  raise SystemExit("No <application tag found")
+              content = content.replace("<application", line + "<application", 1)
+              print(f"Added permission: {perm}")
+          if "android.hardware.location.gps" not in content and "<application" in content:
+              feature = '    <uses-feature android:name="android.hardware.location.gps" android:required="false" />\n'
+              content = content.replace("<application", feature + "<application", 1)
+              print("Added GPS hardware feature")
+          if "android:usesCleartextTraffic" not in content:
+              content = content.replace("<application ", '<application android:usesCleartextTraffic="true" ', 1)
+              print("Enabled usesCleartextTraffic")
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(content)
+          for required in ("ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"):
+              if f"android.permission.{required}" not in content:
+                  raise SystemExit(f"FAILED: missing {required}")
+          print("AndroidManifest.xml patched and verified successfully")
+          PY
+      - name: Verify location permissions in manifest
+        script: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          grep -q 'android.permission.ACCESS_FINE_LOCATION' "$MANIFEST"
+          grep -q 'android.permission.ACCESS_COARSE_LOCATION' "$MANIFEST"
+          echo "Location permissions verified in AndroidManifest.xml"
+      - name: Patch status bar spacing (no full screen under system bars)
+        script: bash scripts/patch-android-statusbar.sh android
+      - name: Verify status bar patch
+        script: |
+          STYLES="android/app/src/main/res/values/styles.xml"
+          grep -q 'android:windowOptOutEdgeToEdgeEnforcement' "$STYLES"
+          grep -q 'android:fitsSystemWindows' "$STYLES"
+          echo "Status bar spacing verified in styles.xml"
+      - name: Build release APK
+        script: |
+          cd android
+          ./gradlew assembleRelease
+    artifacts:
+      - android/app/build/outputs/apk/release/*.apk
+    publishing:
+      email:
+        recipients:
+          - YOUR_EMAIL@example.com
+        notify:
+          success: true
+          failure: true
